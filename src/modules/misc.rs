@@ -9,6 +9,14 @@ const SET_CUSTOM_PROPERTY_FLOAT: &str = "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 
 impl MhyModule for MhyContext<Misc> {
     unsafe fn init(&mut self) -> Result<()> {
         // Dither
+        // -- DISABLED for crash bisection: this is the only `replace` (Retn)
+        //    hook in the whole patch -- every other hook is `attach`
+        //    (JmpBack, observe-only). Retn swaps the function body for a
+        //    `return 0` stub, so every caller proceeds with work undone.
+        //    The client dies ~30s after entering the world with
+        //    [AbilityInstError] spam + 0xC0000005 in ntdll!RtlVirtualUnwind2,
+        //    which points at a hooked/broken call site. Re-enable to test.
+        /*
         let set_custom_property_float = util::pattern_scan_code(self.assembly_name, SET_CUSTOM_PROPERTY_FLOAT);
         if let Some(addr) = set_custom_property_float {
             crate::plog!("set_custom_property_float: {:x}", addr as usize);
@@ -21,6 +29,7 @@ impl MhyModule for MhyContext<Misc> {
         {
             crate::plog!("Failed to find set_custom_property_float");
         }
+        */
 
         Ok(())
     }

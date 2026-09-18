@@ -37,7 +37,7 @@ impl MhyModule for MhyContext<WinHttp> {
         let winhttp = match LoadLibraryA(s!("winhttp.dll")) {
             Ok(handle) if !handle.is_invalid() => handle,
             _ => {
-                println!("Failed to load winhttp.dll - the native SDK will NOT be redirected");
+                crate::plog!("Failed to load winhttp.dll - the native SDK will NOT be redirected");
                 return Ok(());
             }
         };
@@ -51,10 +51,10 @@ impl MhyModule for MhyContext<WinHttp> {
         ] {
             match GetProcAddress(winhttp, name) {
                 Some(addr) => {
-                    println!("{}: {:x}", pcstr_name(name), addr as usize);
+                    crate::plog!("{}: {:x}", pcstr_name(name), addr as usize);
                     self.interceptor.attach(addr as usize, routine)?;
                 }
-                None => println!("Failed to find {}", pcstr_name(name)),
+                None => crate::plog!("Failed to find {}", pcstr_name(name)),
             }
         }
 
@@ -90,7 +90,7 @@ unsafe fn pcstr_name(name: PCSTR) -> String {
 /// rdx = host, r8 = port
 unsafe extern "win64" fn on_winhttp_connect(reg: *mut Registers, _: usize) {
     let host = wide_ptr_to_string((*reg).rdx as *const u16);
-    println!("Redirect: {host}:{} -> {DISPATCH_HOST}:{DISPATCH_PORT}", (*reg).r8 as u16);
+    crate::plog!("Redirect: {host}:{} -> {DISPATCH_HOST}:{DISPATCH_PORT}", (*reg).r8 as u16);
 
     (*reg).rdx = DISPATCH_HOST_W.as_ptr() as u64;
     (*reg).r8 = DISPATCH_PORT;

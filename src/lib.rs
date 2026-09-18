@@ -16,6 +16,7 @@ mod interceptor;
 mod marshal;
 mod modules;
 mod util;
+mod exclog;
 
 use crate::modules::{Http, MhyContext, ModuleManager, Security, WinHttp};
 
@@ -53,6 +54,16 @@ unsafe fn thread_func() {
     module_manager.enable(MhyContext::<WinHttp>::new(&exe_name));
 
     crate::plog!("Successfully initialized!");
+
+    // GameAssembly/mhyprot/zf_cef load after our DllMain; keep the VEH's
+    // suspect table current for ~3 minutes so it can name the faulting
+    // module once the world is loaded and things start dying
+    std::thread::spawn(|| {
+        for _ in 0..90 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            exclog::refresh();
+        }
+    });
 }
 
 lazy_static! {
@@ -61,9 +72,17 @@ lazy_static! {
 
 #[no_mangle]
 #[allow(non_snake_case)]
-unsafe extern "system" fn DllMain(_: HINSTANCE, call_reason: u32, _: *mut ()) -> bool {
+unsafe extern "system" fn DllMain(hinst: HINSTANCE, call_reason: u32, _: *mut ()) -> bool {
     if call_reason == DLL_PROCESS_ATTACH {
         log::start_session();
+
+        // see the exception that starts the crash, not just the unwinder fault
+        // WER is disabled on this box so this is our only crash recorder
+        exclog::install();
+
+        // remember our own module handle before proxy::init resolves
+        // Astrolabe_orig.dll relative to this dll's directory
+        proxy::set_module(hinst);
 
         // here, not on the thread: the game may call the exports once DllMain returns
         proxy::init();

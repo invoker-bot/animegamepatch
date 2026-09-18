@@ -82,11 +82,29 @@ fn main() {
         ));
     }
 
-    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("astrolabe_proxy.rs");
+    let out_dir_str = std::env::var("OUT_DIR").unwrap();
+    let out_dir = std::path::Path::new(&out_dir_str);
+    let out = out_dir.join("astrolabe_proxy.rs");
     std::fs::write(&out, generated).expect("failed to write the generated proxy");
 
     // name them as exports so the loader sees them
-    for name in EXPORTS {
-        println!("cargo:rustc-cdylib-link-arg=/EXPORT:{name}");
+    if std::env::var("CARGO_CFG_TARGET_ENV").unwrap() == "msvc" {
+        // link.exe: one /EXPORT switch per symbol
+        for name in EXPORTS {
+            println!("cargo:rustc-cdylib-link-arg=/EXPORT:{name}");
+        }
+    } else {
+        // GNU ld (mingw): /EXPORT is not understood, feed it a .def file instead
+        let mut def = String::from("LIBRARY ext\nEXPORTS\n");
+        for name in EXPORTS {
+            def.push_str(&format!("  {name}\n"));
+        }
+        let def_path = out_dir.join("astrolabe_exports.def");
+        std::fs::write(&def_path, def).expect("failed to write the .def file");
+
+        // absolute path: the linker's cwd is not necessarily the crate root
+        let def_str = def_path.to_str().expect("non-utf8 OUT_DIR");
+        println!("cargo:rustc-cdylib-link-arg={def_str}");
+        println!("cargo:rerun-if-changed={def_str}");
     }
 }

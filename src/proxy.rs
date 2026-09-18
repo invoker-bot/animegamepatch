@@ -1,14 +1,28 @@
 //! forwards the Astrolabe_* exports to Astrolabe_orig.dll
 
 use std::ffi::CString;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HINSTANCE, HMODULE};
 use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetProcAddress, LoadLibraryW,
 };
 
 include!(concat!(env!("OUT_DIR"), "/astrolabe_proxy.rs"));
+
+/// DllMain's hinstDll is this DLL's own module handle.
+///
+/// GetModuleFileNameW(None) resolves against the *main EXE* (.../7.0.0/
+/// YuanShen.exe), not against this proxy DLL -- so the constructed path pointed
+/// at .../7.0.0/Astrolabe_orig.dll, which does not exist, and LoadLibraryW died
+/// with 0x8007007E. That silently made every forwarded Astrolabe_* export hit
+/// the missing() stub. The real DLL lives in YuanShen_Data/Plugins/.
+static OUR_MODULE: AtomicI64 = AtomicI64::new(0);
+
+pub unsafe fn set_module(h: HINSTANCE) {
+    OUR_MODULE.store(h.0 as i64, Ordering::SeqCst);
+}
 
 /// stub for exports the real dll lacks
 unsafe extern "C" fn missing() -> usize {
@@ -23,9 +37,12 @@ pub unsafe fn init() {
         *slot = stub;
     }
 
-    // beside this dll, not the cwd
+    // beside this dll, not the cwd (None here would give the exe's directory)
     let mut buffer = [0u16; 260];
-    let len = GetModuleFileNameW(None, &mut buffer) as usize;
+    let len = GetModuleFileNameW(
+        HMODULE::from(HINSTANCE(OUR_MODULE.load(Ordering::SeqCst) as isize)),
+        &mut buffer,
+    ) as usize;
     let mut path: Vec<u16> = buffer[..len].to_vec();
     while path.last().is_some_and(|&c| c != b'\\' as u16) {
         path.pop();
