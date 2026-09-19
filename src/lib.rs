@@ -55,11 +55,18 @@ unsafe fn thread_func() {
 
     crate::plog!("Successfully initialized!");
 
-    // GameAssembly/mhyprot/zf_cef load after our DllMain; keep the VEH's
-    // suspect table current for ~3 minutes so it can name the faulting
-    // module once the world is loaded and things start dying
+    // GameAssembly/mhyprot/zf_cef load after our DllMain, and the crash window
+    // is the first ~30s (bundle load). A 2s tick left the slot where the
+    // faulting module lives empty, so the interesting address printed as a raw
+    // number; keep the table tight while it matters, then back off.
     std::thread::spawn(|| {
-        for _ in 0..90 {
+        // 50ms for 30s: a refresh is ~50us, so this is still idle
+        for _ in 0..600 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            exclog::refresh();
+        }
+        // 2s for another 10 min, in case it dies later in the session
+        for _ in 0..300 {
             std::thread::sleep(std::time::Duration::from_secs(2));
             exclog::refresh();
         }

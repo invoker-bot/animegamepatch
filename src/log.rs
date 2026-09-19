@@ -12,6 +12,16 @@ pub fn path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("lunagc-patch.log"))
 }
 
+/// the exception handler's own crash log -- separate from path() so the
+/// mapped view and this writer can never step on each other
+pub fn exc_path() -> PathBuf {
+    std::env::var("LUNAGC_EXC_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("lunagc-exc.log"))
+}
+
 /// fresh log per launch
 pub fn start_session() {
     let _ = std::fs::write(path(), b"");
