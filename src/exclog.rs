@@ -73,24 +73,49 @@ static POS: AtomicUsize = AtomicUsize::new(0);
 static FULL: AtomicBool = AtomicBool::new(false);
 /// the mapping handle, kept alive for the life of the process
 static MAPPING: AtomicU64 = AtomicU64::new(0);
+/// the raw handle of the file, kept if the mapping could not be created so the
+/// fallback path still records something
+static FALLBACK: AtomicU64 = AtomicU64::new(0);
 
-/// copies a line into the mapping; the only memory the handler ever mutates
+/// copies a line into the mapping, or writes it to the fallback file; the only
+/// memory this ever touches is the mapped view, plus one kernel call when the
+/// mapping was refused
 fn emit(buf: &[u8]) {
     let view = VIEW.load(Ordering::Relaxed) as usize;
-    if view == 0 || FULL.load(Ordering::Relaxed) {
+    if view != 0 {
+        if FULL.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(pos) = POS.fetch_add(buf.len(), Ordering::Relaxed).checked_add(buf.len()) else {
+            return;
+        };
+        if pos > MAP_CAP {
+            FULL.store(true, Ordering::Relaxed);
+            return;
+        }
+        let start = pos - buf.len();
+        // plain copy, no kernel call -- the MM flushes on unmap, even at death
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), (view + start) as *mut u8, buf.len());
+        }
         return;
     }
-    let Some(pos) = POS.fetch_add(buf.len(), Ordering::Relaxed).checked_add(buf.len()) else {
-        return;
-    };
-    if pos > MAP_CAP {
-        FULL.store(true, Ordering::Relaxed);
-        return;
-    }
-    let start = pos - buf.len();
-    // plain copy, no kernel call -- the MM flushes on unmap, even at death
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), (view + start) as *mut u8, buf.len());
+    // fallback: a handle opened once at install(), one WriteFile per line. This
+    // *is* a kernel call from the exception path, which the mapping exists to
+    // avoid -- but the previous best case here was "no crash record at all",
+    // and a captured fault is worth more than a clean theory
+    let file = FALLBACK.load(Ordering::Relaxed) as *mut winapi::ctypes::c_void;
+    if !file.is_null() {
+        unsafe {
+            let mut written: u32 = 0;
+            winapi::um::fileapi::WriteFile(
+                file,
+                buf.as_ptr() as *const winapi::ctypes::c_void,
+                buf.len() as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            );
+        }
     }
 }
 
@@ -121,6 +146,8 @@ const ZERO_MOD: Mod = Mod {
 static MODULES: [Mod; MAX_MODULES] = [ZERO_MOD; MAX_MODULES];
 /// number of populated slots; grows only, and only from refresh()
 static MODULE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// set once the first walk has reported its stats -- the number matters once
+static DIAGNOSED: AtomicBool = AtomicBool::new(false);
 
 fn code_name(code: u32) -> &'static str {
     match code {
@@ -161,13 +188,17 @@ pub fn refresh() {
         if !is_user(head as usize) {
             return;
         }
-        let first = (*(head as *const ListEntry)).flink;
+        let head = head as *const ListEntry;
+        let first = (*head).flink;
         if !is_user(first as usize) {
             return;
         }
         let mut cur = first;
         let mut walked = 0;
-        while cur != first.sub(0) && is_user(cur as usize) {
+        // the chain circles back to `head`, the list head inside PEB_LDR_DATA --
+        // not to `first`, which is the first *entry* (the old condition
+        // compared against first and so never ran the body once)
+        while cur != head && is_user(cur as usize) {
             walked += 1;
             if walked > MAX_WALK {
                 break;
@@ -189,6 +220,10 @@ pub fn refresh() {
                 }
             }
             cur = next;
+        }
+        if !DIAGNOSED.swap(true, Ordering::Relaxed) {
+            let total = MODULE_COUNT.load(Ordering::Relaxed);
+            crate::log::write(&format!("[exc] peb walk: walked={walked} kept={total}"));
         }
     }
     if added > 0 {
@@ -434,13 +469,23 @@ pub unsafe fn install() {
 /// opens the crash log as a file mapping once, from a normal context. The
 /// handler then never needs the filesystem: it copies into the view, and the
 /// MM persists it. A separate file from the patch log so the two writers
-/// cannot interleave.
+/// cannot interleave. If the mapping is refused, the file handle is kept and
+/// written directly instead -- worse than the mapping, better than nothing.
 unsafe fn open_mapping() {
     use std::fs::OpenOptions;
     use std::os::windows::io::AsRawHandle;
 
     let path = crate::log::exc_path();
-    let file = match OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
+    // read AND write: CreateFileMappingW wants GENERIC_READ on the handle for a
+    // PAGE_READWRITE section, and rejects a write-only handle with null, saying
+    // nothing in the process
+    let file = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(true)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(e) => {
             crate::log::write(&format!("[exc] could not open {path:?}: {e}"));
@@ -450,16 +495,18 @@ unsafe fn open_mapping() {
     // the whole mapping has to be backed by real file bytes, or a write past
     // the end of the file would fault inside the handler -- the exact thing
     // this redesign exists to avoid
-    if file.set_len(MAP_CAP as u64).is_err() || file.metadata().map(|m| m.len()).ok() != Some(MAP_CAP as u64) {
+    if file.set_len(MAP_CAP as u64).is_err()
+        || file.metadata().map(|m| m.len()).ok() != Some(MAP_CAP as u64)
+    {
         crate::log::write("[exc] could not size the exception log");
         return;
     }
 
     use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS};
-    use winapi::um::winnt::PAGE_READWRITE;
+    use winapi::um::winnt::{HANDLE, PAGE_READWRITE};
 
     let mapping = CreateFileMappingW(
-        file.as_raw_handle() as *mut _,
+        file.as_raw_handle() as HANDLE,
         core::ptr::null_mut(),
         PAGE_READWRITE,
         0,
@@ -467,14 +514,24 @@ unsafe fn open_mapping() {
         core::ptr::null(),
     );
     if mapping.is_null() {
-        crate::log::write("[exc] could not map the exception log");
+        let err = winapi::um::errhandlingapi::GetLastError();
+        crate::log::write(&format!(
+            "[exc] CreateFileMappingW refused: GetLastError={} (5=ACCESS_DENIED, 87=BAD_ARG)",
+            err as u32
+        ));
+        // keep the handle and write to it directly; no record at all is the
+        // failure we are fixing
+        use std::os::windows::io::IntoRawHandle;
+        FALLBACK.store(file.into_raw_handle() as u64, Ordering::Relaxed);
+        emit(b"[exc] first-chance exception log (fallback: direct writes, mapping refused)\n");
         return;
     }
     MAPPING.store(mapping as u64, Ordering::Relaxed);
 
     let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
     if view.is_null() {
-        crate::log::write("[exc] could not map the view");
+        let err = winapi::um::errhandlingapi::GetLastError();
+        crate::log::write(&format!("[exc] MapViewOfFile refused: GetLastError={}", err as u32));
         return;
     }
     VIEW.store(view as u64, Ordering::Relaxed);
@@ -482,7 +539,6 @@ unsafe fn open_mapping() {
     // hold both until the process dies; closing them is not worth a Drop
     core::mem::forget(file);
 
-    let mut header = *b"[exc] first-chance exception log (0 = no kernel calls on the exception path)\n";
-    emit(&mut header);
+    emit(b"[exc] first-chance exception log (0 = no kernel calls on the exception path)\n");
     crate::log::write(&format!("[exc] exception log at {}", path.display()));
 }
