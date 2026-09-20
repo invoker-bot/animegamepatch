@@ -29,6 +29,25 @@ unsafe extern "C" fn missing() -> usize {
     0
 }
 
+/// Astrolabe exports that run the anti-cheat's *own* periodic self-checks.
+///
+/// This proxy sits in the Astrolabe.dll module slot, so those checks inspect
+/// our image rather than the signed original, fail, and their failure path
+/// unwinds a stack straight into ntdll!RtlVirtualUnwind2+0xDC7 about 100s into
+/// every session -- the "The client is damaged, please reinstall the client"
+/// death. A private server has no use for the check, so route these to the
+/// missing() stub instead of the real implementation.
+///
+/// `LUNAGC_DISABLE=detect` (or the same line in %TEMP%\lunagc-disable.txt)
+/// forwards them normally, kept for A/B testing the diagnosis.
+const NEUTRALIZE: &[&str] = &[
+    "Astrolabe_AddDetectionThread",
+    "Astrolabe_RemoveDetectionThread",
+    "Astrolabe_InstallMemMonitor",
+    "Astrolabe_InstallHang",
+    "Astrolabe_OnHang",
+];
+
 /// fills the table from Astrolabe_orig.dll, next to this dll
 pub unsafe fn init() {
     // seed first, so no slot is ever 0
@@ -77,5 +96,16 @@ pub unsafe fn init() {
         resolved,
         NAMES.len()
     );
+
+    // see NEUTRALIZE: done after resolution so the A/B switch can compare a
+    // fully-forwarded table against a neutralized one
+    if !crate::is_off(&crate::disabled(), "detect") {
+        for (i, name) in NAMES.iter().enumerate() {
+            if NEUTRALIZE.contains(name) {
+                REAL[i] = stub;
+                crate::plog!("[proxy] neutralized {name} (anti-cheat self-check)");
+            }
+        }
+    }
     let _: HMODULE = real;
 }
