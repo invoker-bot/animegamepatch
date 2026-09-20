@@ -25,6 +25,16 @@
 //! The handler never suppresses anything: it returns EXCEPTION_CONTINUE_SEARCH
 //! after logging.
 //!
+//! THE INSTALL IS STILL THE PROBLEM. AddVectoredExceptionHandler(1) inserts us
+//! ahead of mhypbase's own handler, and that chain position is visible to the
+//! anti-cheat. With the signature swap in place, an idle session that installs
+//! this recorder dies at ~94s at ntdll!RtlVirtualUnwind2+0xFB77 (caller
+//! mhypbase.dll+0x195AFB2, the same kill the signature gate used) while the
+//! identical session without it survives 80 minutes -- both with the signed
+//! stock DLL occupying the on-disk slot for the whole run. The exception path
+//! is safe; being in the chain at all is not. So lib.rs installs this only
+//! when explicitly asked (LUNAGC_EXCLOG=1 or %TEMP%\lunagc-exclog.txt).
+//!
 //! Module resolution happens in refresh() from a normal context by walking the
 //! PEB loader list -- that covers every loaded module, not a hand-picked few,
 //! and it needs no API calls. on_exception only reads the resulting table.

@@ -28,8 +28,8 @@ use crate::modules::{Http, MhyContext, ModuleManager, Security, WinHttp};
 /// winhttp, memguard, console, detect. Absent/empty = full patch.
 /// `detect` is special: it does not disable a hook, it re-enables the
 /// anti-cheat's own self-check exports that proxy.rs neutralizes by default.
-/// `exclog` likewise gates the exception recorder, which changes the game's
-/// failure mode and so has to be A/B testable.
+/// `exclog` gates the exception recorder. It is OFF by default now -- see
+/// recorder_wanted() -- because installing it is itself detectable.
 /// `swap` gates swap.rs: leaving the signed stock DLL in the on-disk slot
 /// while our patched image stays mapped, so the signature verifier reads a
 /// file it is happy with. Disabling it brings back the ~90s kill.
@@ -49,6 +49,33 @@ fn disabled() -> Vec<String> {
 
 fn is_off(off: &[String], name: &str) -> bool {
     off.iter().any(|s| s == name)
+}
+
+/// Whether exclog's exception recorder should be installed at all.
+///
+/// AddVectoredExceptionHandler(1) puts us FIRST in the chain, ahead of
+/// mhypbase's own handler, and that ordering is visible to the anti-cheat.
+/// Two otherwise-identical idle sessions, swap engaged in both:
+///   recorder OFF -> ran for 80 minutes (killed only by the operator)
+///   recorder ON  -> died at ~94s, AV at ntdll!RtlVirtualUnwind2+0xFB77,
+///                   caller mhypbase.dll+0x195AFB2 -- the same kill the
+///                   signature gate used, but with the signed stock DLL
+///                   sitting in the on-disk slot the whole time
+/// So the recorder is opt-in and exists only for crash hunting.
+/// `LUNAGC_DISABLE=exclog` still force-kills it even when asked for.
+fn recorder_wanted(off: &[String]) -> bool {
+    if is_off(off, "exclog") {
+        return false;
+    }
+    // Start-Process across the UAC boundary drops our session env vars, so a
+    // marker file beside the disable list is the reliable way to ask for it
+    std::env::var("LUNAGC_EXCLOG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || std::path::Path::new(&std::env::temp_dir())
+            .join("lunagc-exclog.txt")
+            .exists()
 }
 
 unsafe fn thread_func() {
@@ -113,7 +140,7 @@ unsafe fn thread_func() {
     // is the first ~30s (bundle load). A 2s tick left the slot where the
     // faulting module lives empty, so the interesting address printed as a raw
     // number; keep the table tight while it matters, then back off.
-    if !is_off(&off, "exclog") {
+    if recorder_wanted(&off) {
         std::thread::spawn(|| {
         // 50ms for 30s: a refresh is ~50us, so this is still idle
         for _ in 0..600 {
@@ -145,14 +172,21 @@ unsafe extern "system" fn DllMain(hinst: HINSTANCE, call_reason: u32, _: *mut ()
         // -- BISECTION: installing this handler changes the failure mode. With
         //    it absent the game AVs in ntdll!RtlVirtualUnwind2 at 100s; with it
         //    present the process leaves silently at 42-64s before that window
-        //    opens. Both are symptoms, so the recorder is switchable now:
-        //    LUNAGC_DISABLE=exclog removes it entirely, for A/B testing.
+        //    opens. Both are symptoms, so the recorder is switchable.
         //    (It installs FIRST in the chain -- AddVectoredExceptionHandler(1)
         //    -- ahead of mhypbase's own handler, and runs on every first-chance
         //    exception. exclog.rs documents two previous revisions where the
         //    recorder itself was the killer; the current one touches only a
         //    file mapping on the exception path.)
-        if !is_off(&disabled(), "exclog") {
+        //
+        // -- UPDATE: with the swap fix in, that ordering itself is the trigger.
+        //    An idle session with the recorder installed dies at ~94s at the
+        //    same ntdll!RtlVirtualUnwind2 site while the identical session
+        //    without it survives 80 minutes, both with the signed stock DLL in
+        //    the on-disk slot. So it is opt-in now (LUNAGC_EXCLOG=1 or
+        //    %TEMP%\lunagc-exclog.txt), not switchable-by-default. See
+        //    recorder_wanted().
+        if recorder_wanted(&disabled()) {
             exclog::install();
         }
 
@@ -168,6 +202,13 @@ unsafe extern "system" fn DllMain(hinst: HINSTANCE, call_reason: u32, _: *mut ()
         // same directory either way.
         if !is_off(&disabled(), "swap") {
             swap::engage(hinst);
+            // AccountPlatNative.dll loads with the login flow, long after this
+            // DllMain returns, so its slot is swapped from a poller thread
+            // instead -- see swap::engage_apn for why an external timer cannot
+            // hit the window. Spawning here, under the loader lock, only delays
+            // the thread until this DllMain returns; the SDK is not due for
+            // another ~16s.
+            swap::engage_apn();
         }
 
         // here, not on the thread: the game may call the exports once DllMain returns
