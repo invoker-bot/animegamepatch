@@ -96,7 +96,82 @@ unsafe extern "win64" fn on_mhy_rsa(reg: *mut Registers, _: usize) {
 
 unsafe extern "win64" fn on_sdk_util_rsa_encrypt(reg: *mut Registers, _: usize) {
     // rcx = key, rdx = plaintext
-    crate::plog!("[*] SDK RSA: key replaced");
+    let Some(original) = read_sdk_string((*reg).rcx) else { return; };
+    let Some(plaintext) = read_sdk_string((*reg).rdx) else { return; };
+    if !should_replace_sdk_key(&original, &plaintext) {
+        crate::plog!("[*] SDK RSA: original key preserved (modulus bytes: {:?})", rsa_modulus_bytes(&original));
+        return;
+    }
+    crate::plog!("[*] SDK RSA: login key replaced");
     (*reg).rcx =
         marshal::ptr_to_string_ansi(CString::new(SDK_PUBLIC_KEY).unwrap().as_c_str()) as u64;
+}
+
+unsafe fn read_sdk_string(pointer: u64) -> Option<String> {
+    if pointer == 0 { return None; }
+    let length = *((pointer + 16) as *const i32);
+    if !(0..=16384).contains(&length) { return None; }
+    String::from_utf16(std::slice::from_raw_parts((pointer + 20) as *const u16, length as usize)).ok()
+}
+
+fn rsa_modulus_bytes(xml: &str) -> Option<usize> {
+    let value = xml.split_once("<Modulus>")?.1.split_once("</Modulus>")?.0;
+    let mut length = 0;
+    let mut padding = 0;
+    for b in value.bytes().filter(|b| !b.is_ascii_whitespace()) {
+        if b == b'=' { padding += 1; }
+        else if padding != 0 || !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/') { return None; }
+        length += 1;
+    }
+    if length == 0 || length % 4 != 0 || padding > 2 { return None; }
+    Some(length / 4 * 3 - padding)
+}
+
+fn should_replace_sdk_key(original: &str, plaintext: &str) -> bool {
+    // NoticeManager encrypts its cookie with a separate 2048-bit key. Replacing
+    // it with the 1024-bit login key throws before the WebView loads its URL.
+    let replacement_size = rsa_modulus_bytes(SDK_PUBLIC_KEY);
+    replacement_size == Some(128) && rsa_modulus_bytes(original) == replacement_size
+        && plaintext.len() <= 128 - 11 // RSA PKCS#1 v1.5 maximum UTF-8 payload.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public_key(modulus_bytes: usize) -> String {
+        let padding = (3 - modulus_bytes % 3) % 3;
+        let length = modulus_bytes.div_ceil(3) * 4;
+        format!("<RSAKeyValue><Modulus>{}{}</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>",
+            "A".repeat(length - padding), "=".repeat(padding))
+    }
+
+    #[test]
+    fn announcement_cookie_keeps_its_original_2048_bit_key() {
+        assert!(!should_replace_sdk_key(&public_key(256), &"x".repeat(180)));
+        assert!(!should_replace_sdk_key(&public_key(256), "short cookie"));
+    }
+
+    #[test]
+    fn short_login_payload_still_uses_server_key() {
+        assert!(should_replace_sdk_key(&public_key(128), "password"));
+        assert!(should_replace_sdk_key(&public_key(128), &"x".repeat(117)));
+    }
+
+    #[test]
+    fn overlong_or_unknown_inputs_are_not_downgraded() {
+        assert!(!should_replace_sdk_key(&public_key(128), &"x".repeat(118)));
+        assert!(!should_replace_sdk_key(&public_key(128), &"汉".repeat(40)));
+        assert!(!should_replace_sdk_key(&public_key(512), "data"));
+        for unknown in ["", "not an XML key", "<RSAKeyValue><Modulus>?</Modulus></RSAKeyValue>",
+                "<RSAKeyValue><Modulus>AA=A</Modulus></RSAKeyValue>"] {
+            assert!(!should_replace_sdk_key(unknown, "data"));
+        }
+    }
+
+    #[test]
+    fn formatted_xml_keeps_login_key_recognition() {
+        let formatted = public_key(128).replace("<Modulus>", "<Modulus>\n  ").replace("</Modulus>", "\n</Modulus>");
+        assert!(should_replace_sdk_key(&formatted, "password"));
+    }
 }
