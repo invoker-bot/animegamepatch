@@ -51,6 +51,24 @@ fn is_off(off: &[String], name: &str) -> bool {
     off.iter().any(|s| s == name)
 }
 
+fn is_game_executable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("GenshinImpact.exe") || name.eq_ignore_ascii_case("YuanShen.exe")
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::is_game_executable;
+
+    #[test]
+    fn windows_launch_path_case_does_not_disable_the_patch() {
+        for name in ["YuanShen.exe", "yuanshen.exe", "YUANSHEN.EXE", "GenshinImpact.exe", "genshinimpact.exe"] {
+            assert!(is_game_executable(name));
+        }
+        assert!(!is_game_executable("launcher.exe"));
+        assert!(!is_game_executable("YuanShen.exe.backup"));
+    }
+}
+
 /// Whether exclog's exception recorder should be installed at all.
 ///
 /// AddVectoredExceptionHandler(1) puts us FIRST in the chain, ahead of
@@ -105,7 +123,7 @@ unsafe fn thread_func() {
     let exe_name = Path::new(exe_path).file_name().unwrap().to_str().unwrap();
     crate::plog!("Current executable name: {}", exe_name);
 
-    if exe_name != "GenshinImpact.exe" && exe_name != "YuanShen.exe" {
+    if !is_game_executable(exe_name) {
         crate::plog!("Executable is not Genshin. Skipping initialization.");
         return;
     }
@@ -120,6 +138,7 @@ unsafe fn thread_func() {
     }
     if !is_off(&off, "http") {
         module_manager.enable(MhyContext::<Http>::new(&exe_name));
+        modules::start_native_sdk_prices();
     }
     if !is_off(&off, "misc") {
         module_manager.enable(MhyContext::<Misc>::new(&exe_name));

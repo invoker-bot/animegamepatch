@@ -9,12 +9,14 @@ mod http;
 mod misc;
 mod security;
 mod winhttp;
+mod native_sdk;
 
 pub use ccp_blocker::CcpBlocker;
 pub use http::Http;
 pub use misc::Misc;
 pub use security::Security;
 pub use winhttp::WinHttp;
+pub use native_sdk::start_when_loaded as start_native_sdk_prices;
 
 #[derive(Default)]
 pub struct ModuleManager {
@@ -47,6 +49,7 @@ pub enum ModuleType {
     Misc,
     CcpBlocker,
     WinHttp,
+    NativeSdkPrices,
 }
 
 pub trait MhyModule {
